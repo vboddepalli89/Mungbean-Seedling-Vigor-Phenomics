@@ -49,4 +49,3 @@ Boddepalli, V.N., Shen, Y., Dutta, S., & Singh, A. (2026). UAV-based high-throug
 
 **Venkata Naresh Boddepalli** Ph.D. Candidate, Department of Agronomy  
 Iowa State University, Ames, IA, USA  
-[Your Email Here]
