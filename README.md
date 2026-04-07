@@ -1,4 +1,3 @@
-This repository contains the high-throughput phenotyping (HTP) pipeline and genetic analysis scripts for the study:  
 **"UAV-based high-throughput phenotyping enables genetic dissection and genomic prediction of early seedling vigor in mungbean (Vigna radiata L.)"**
 
 ## Project Overview
