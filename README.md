@@ -43,7 +43,7 @@ The analysis follows a four-stage pipeline:
 
 ## Citation
 
-Boddepalli, V.N., Shen, Y., Dutta, S., & Singh, A. (2026). UAV-based high-throughput phenotyping enables genetic dissection and genomic prediction of early seedling vigor in mungbean (*Vigna radiata* L.). *Frontiers in Plant Science* (Submitted).
+Boddepalli, V.N., Shen, Y., Dutta, S., & Singh, A. (2026). UAV-based high-throughput phenotyping enables genetic dissection and genomic prediction of early seedling vigor in mungbean (*Vigna radiata* L.). 
 
 ## Contact
 
