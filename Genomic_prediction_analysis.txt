@@ -1,0 +1,746 @@
+# Setup and Libraries
+library(rrBLUP)
+library(dplyr)
+library(ggplot2)
+library(parallel)
+
+# Check number of cores
+detectCores()
+
+# Import and prepare genotype data
+geno_raw <- read.table(
+  "vigor_numerical.txt",
+  header = TRUE,
+  sep = "\t",
+  row.names = 1,
+  check.names = FALSE
+)
+
+cat("Original genotype dimensions:", dim(geno_raw), "\n")
+
+# Convert to numeric matrix
+X <- as.matrix(geno_raw)
+X <- apply(X, 2, as.numeric)
+rownames(X) <- rownames(geno_raw)
+
+# Missing data check
+missing_prop <- sum(is.na(X)) / (nrow(X) * ncol(X))
+cat("Proportion of missing data:", round(missing_prop * 100, 2), "%\n")
+
+# Peek at the first few rows and columns
+X[1:5, 1:10]
+
+# Import phenotype data (BLUPs)
+pheno <- read.csv("blues.csv", stringsAsFactors = FALSE)
+
+cat("Phenotype data dimensions:", dim(pheno), "\n")
+cat("Trait names:", colnames(pheno)[-1], "\n")
+
+# Match genotypes to phenotype data
+common_genos <- intersect(rownames(X), pheno$Taxa)
+cat("Number of common genotypes:", length(common_genos), "\n")
+
+# Reorder genotype matrix and phenotype data
+X <- X[common_genos, , drop = FALSE]
+pheno_matched <- pheno[match(common_genos, pheno$Taxa), ]
+y <- pheno_matched
+
+head(y)
+
+# Compute genomic relationship matrix (G matrix)
+cat("Computing genomic relationship matrix with EM imputation\n")
+
+A1 <- A.mat(
+  X,
+  impute.method = "EM",
+  n.core = 1,
+  max.missing = 0.5
+)
+
+rownames(A1) <- rownames(X)
+colnames(A1) <- rownames(X)
+
+cat("G matrix dimensions:", dim(A1), "\n")
+cat("Range of G values:", range(A1), "\n")
+
+# Quick look at the structure of the genomic relationship matrix
+heatmap(
+  A1[1:100, 1:100],
+  main = "Genomic relationship (first 100)",
+  col = colorRampPalette(c("blue", "white", "red"))(100)
+)
+
+# Cross-validation setup
+set.seed(123)
+
+cycles <- 100
+folds  <- 10
+
+trait_names <- colnames(y)[-1]
+n_traits <- length(trait_names)
+
+cat("Cross-validation setup\n")
+cat("  cycles:", cycles, "\n")
+cat("  folds:", folds, "\n")
+cat("  traits:", n_traits, "\n")
+
+# Initialize storage for prediction accuracy
+prediction_accuracy <- matrix(nrow = cycles * folds, ncol = n_traits)
+colnames(prediction_accuracy) <- colnames(y)[-1]
+
+all_gebvs <- list()
+
+# Loop through cycles for cross-validation
+for (cycle in 1:cycles) {
+  if (cycle %% 10 == 0) cat("  Processing cycle", cycle, "of", cycles, "\n")
+  
+  # Create fold assignments (move this outside the fold loop)
+  set.seed(cycle)  # Ensures different train/test splits across cycles
+  fold_assignments <- sample(rep(1:folds, length.out = length(common_genos)))
+  
+  cycle_gebvs <- list()
+  
+  # Loop through traits for prediction
+  for (trait_idx in 2:ncol(y)) {
+    trait_name <- colnames(y)[trait_idx]
+    
+    # Loop through folds
+    for (fold in 1:folds) {
+      
+      # Get test genotypes for this fold
+      test_genos <- common_genos[fold_assignments == fold]
+      
+      # Create training dataset (mask test genotypes)
+      y_train <- y
+      y_train[y_train$Taxa %in% test_genos, trait_idx] <- NA
+      
+      # Run genomic prediction using rrBLUP
+      gp_model <- kin.blup(data = y_train, 
+                           geno = "Taxa", 
+                           pheno = trait_name, 
+                           K = A1)
+      
+      # Get predicted values for test set
+      y_test_actual <- y[y$Taxa %in% test_genos, trait_idx]
+      y_test_pred <- gp_model$g[test_genos]
+      
+      # Calculate prediction accuracy (correlation)
+      accuracy <- cor(y_test_pred, y_test_actual, 
+                      method = "pearson", 
+                      use = "complete.obs")
+      
+      # Store accuracy
+      row_idx <- (cycle - 1) * folds + fold
+      prediction_accuracy[row_idx, trait_idx - 1] <- accuracy
+      
+      # Store GEBVs for the first cycle
+      if (cycle == 1 && fold == 1) {
+        cycle_gebvs[[trait_name]] <- gp_model$g
+      }
+    }
+  }
+  
+  # Store GEBVs from the first cycle
+  if (cycle == 1) {
+    all_gebvs <- cycle_gebvs
+  }
+}
+
+# Summary of the computation time
+cat("\nTotal time:", round(difftime(Sys.time(), start.time, units = "mins"), 2), "minutes\n")
+
+# Summarize results
+accuracy_summary <- data.frame(
+  Trait = colnames(prediction_accuracy),
+  Mean_Accuracy = apply(prediction_accuracy, 2, mean, na.rm = TRUE),
+  SD_Accuracy = apply(prediction_accuracy, 2, sd, na.rm = TRUE),
+  Min_Accuracy = apply(prediction_accuracy, 2, min, na.rm = TRUE),
+  Max_Accuracy = apply(prediction_accuracy, 2, max, na.rm = TRUE)
+)
+
+accuracy_summary <- accuracy_summary[order(-accuracy_summary$Mean_Accuracy), ]
+rownames(accuracy_summary) <- NULL
+
+print(accuracy_summary)
+
+# Visualize prediction accuracy
+accuracy_long <- data.frame(
+  Trait = rep(colnames(prediction_accuracy), each = nrow(prediction_accuracy)),
+  Accuracy = as.vector(prediction_accuracy)
+)
+
+ggplot(accuracy_long, aes(x = reorder(Trait, Accuracy, FUN = median), y = Accuracy)) +
+  geom_boxplot(fill = "lightblue", alpha = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  coord_flip() +
+  labs(title = "Genomic Prediction Accuracy by Trait",
+       subtitle = paste0(cycles, " cycles × ", folds, " folds cross-validation"),
+       x = "Trait",
+       y = "Prediction Accuracy (Pearson correlation)") +
+  theme_bw() +
+  theme(axis.text.y = element_text(size = 10))
+
+# Save results
+timestamp <- format(Sys.time(), "%Y-%m-%d_%H%M")
+
+write.csv(prediction_accuracy, 
+          paste0("WGP_SeedTraits_Accuracy_", timestamp, "_", cycles, "cycles_", folds, "folds.csv"),
+          row.names = FALSE)
+
+write.csv(accuracy_summary,
+          paste0("WGP_SeedTraits_AccuracySummary_", timestamp, ".csv"),
+          row.names = FALSE)
+
+gebvs_df <- data.frame(Taxa = names(all_gebvs[[1]]))
+for (trait in names(all_gebvs)) {
+  gebvs_df[[trait]] <- all_gebvs[[trait]][gebvs_df$Taxa]
+}
+write.csv(gebvs_df,
+          paste0("WGP_SeedTraits_GEBVs_", timestamp, ".csv"),
+          row.names = FALSE)
+
+cat("\nResults saved with timestamp:", timestamp, "\n")
+#################################################
+# Helper function to get the top k taxa for a given numeric vector
+get_topk <- function(x, taxa, k = 10, decreasing = TRUE) {
+  ord <- order(x, decreasing = decreasing, na.last = NA)
+  taxa[ord][seq_len(min(k, sum(!is.na(x))))]  # Return top k genotypes
+}
+
+# Initialize an empty list to store results
+res_list <- list()
+
+# Loop over traits to calculate the Coincidence Index (CI)
+for (tr in colnames(y)[-1]) {  # Loop through all traits (excluding the "Taxa" column)
+  
+  # Get the BLUP values and GEBV values for the trait
+  blup_vals <- y[[tr]]
+  gebv_vals <- all_gebvs[[tr]]
+  
+  # Get top k genotypes from BLUPs and GEBVs
+  top_blup <- get_topk(blup_vals, taxa = y$Taxa, k = 10)  # top 10 based on BLUPs
+  top_gebv <- get_topk(gebv_vals, taxa = y$Taxa, k = 10)  # top 10 based on GEBVs
+  
+  # Calculate the Coincidence Index (CI) - the percentage overlap between top BLUPs and top GEBVs
+  ci_fun <- function(a, b) {
+    # Calculate the intersection of the two sets and return the coincidence percentage
+    if (any(is.na(a)) || any(is.na(b))) return(NA_real_)
+    length(intersect(a, b)) / length(a) * 100
+  }
+  
+  # Calculate CI for the current trait
+  ci_blup_gebv <- ci_fun(top_blup, top_gebv)
+  
+  # Store results for this trait
+  res_list[[tr]] <- data.frame(
+    Trait = tr,
+    CI_BLUP_GEBV = ci_blup_gebv,
+    stringsAsFactors = FALSE
+  )
+}
+
+# ... [Your existing loop code above] ...
+
+# Combine results into a single data frame (already in your code)
+coincidence_results <- dplyr::bind_rows(res_list)
+
+# ------------------------------------------------------------------
+# SAVE THE RESULTS
+# ------------------------------------------------------------------
+
+# 1. Generate a timestamp (Optional, but keeps files unique)
+timestamp <- format(Sys.time(), "%Y%m%d_%H%M")
+
+# 2. Define the filename
+output_filename <- paste0("Coincidence_Index_Results_", timestamp, ".csv")
+
+# 3. Write the data frame to CSV
+# row.names = FALSE prevents R from adding an index column (1, 2, 3...) to the file
+write.csv(coincidence_results, file = output_filename, row.names = FALSE)
+
+# 4. Print confirmation
+print(paste("Results successfully saved to:", output_filename))
+#############################
+library(ggplot2)
+
+# Plot the Coincidence Index (CI) for each trait
+ggplot(coincidence_results, aes(x = reorder(Trait, CI_BLUP_GEBV), y = CI_BLUP_GEBV)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  coord_flip() +
+  labs(title = "Selection Coincidence Index (CI) Between BLUPs and GEBVs",
+       x = "Trait", y = "Coincidence Index (%)") +
+  theme_minimal()
+#############################combined plot###########
+# Load necessary libraries
+library(ggplot2)
+library(patchwork)
+
+# Load necessary libraries
+library(ggplot2)
+library(patchwork)
+
+# Define polished trait names
+trait_labels <- c(
+  "SVG_score"    = "Vigor Score",
+  "canopy_coverage"     = "Canopy Area",
+  "canopy_height" = "Canopy Height",
+  "canopy_volume_index" = "Canopy Volume Index",
+  "ExGR"      = "ExGR",
+  "NGRDI" = "NGRDI"
+)
+
+
+# Plot 1: Genomic Prediction Accuracy with polished trait names
+accuracy_long <- data.frame(
+  Trait = rep(colnames(prediction_accuracy), each = nrow(prediction_accuracy)),
+  Accuracy = as.vector(prediction_accuracy)
+)
+
+plot1 <- ggplot(accuracy_long, aes(x = reorder(Trait, Accuracy, FUN = median), y = Accuracy)) +
+  geom_boxplot(fill = "lightblue", alpha = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  coord_flip() +
+  labs(title = "A. Genomic Prediction Accuracy",
+       x = "Trait", y = "Prediction Accuracy (Pearson correlation)") +
+  scale_x_discrete(labels = trait_labels) +  # Apply polished trait names
+  theme_bw() +
+  theme(axis.text.y = element_text(size = 10))
+
+# Plot 2: Selection Coincidence Index with ordered traits and angled labels
+plot2 <- ggplot(coincidence_results, aes(x = reorder(Trait, CI_BLUP_GEBV), y = CI_BLUP_GEBV)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  labs(title = "B. Selection Coincidence Index",
+       x = "Trait", y = "Coincidence Index (%)") +
+  scale_x_discrete(labels = trait_labels) +  # Apply polished trait names
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Angle the trait names to avoid overlap
+
+# Combine both plots using patchwork
+combined_plot <- plot1 + plot2 + plot_layout(ncol = 1)
+
+# Print the combined plot
+print(combined_plot)
+
+# Save the combined plot as a JPG file
+output_path <- "combined_plot.jpg"  # Define the file path
+ggsave(output_path, plot = combined_plot, width = 10, height = 12, dpi = 300)
+
+cat("Combined plot saved as", output_path, "\n")
+############################################################
+## Genomic prediction with trait-specific significant SNPs
+## gBLUP + fixed SNPs
+############################################################
+
+rm(list = ls())
+start.time <- Sys.time()
+
+library(rrBLUP)
+library(dplyr)
+library(ggplot2)
+library(patchwork)
+
+##----------------------------------------------------------
+## 1. Setup and input
+##----------------------------------------------------------
+setwd(r"(C:\Users\naresh89\Desktop\My projects\gwas\seedlingvigor&seedweight\Genomic_prediction\GBLUP_SNP)")
+
+## genotype
+geno_raw <- read.table(
+  "vigor_numerical.txt",
+  header = TRUE,
+  sep = "\t",
+  row.names = 1,
+  check.names = FALSE
+)
+
+cat("Original genotype dimensions:", dim(geno_raw), "\n")
+
+X <- as.matrix(geno_raw)
+X <- apply(X, 2, as.numeric)
+rownames(X) <- rownames(geno_raw)
+
+## phenotype (blues)
+blues <- read.csv("blues.csv", stringsAsFactors = FALSE)
+cat("Phenotype dimensions:", dim(blues), "\n")
+cat("Phenotype traits:", colnames(blues)[-1], "\n")
+
+## trait specific significant SNPs
+## file must have columns: Trait, SNP
+snps_all <- read.csv("sig_snps_3.csv", stringsAsFactors = FALSE)
+
+##----------------------------------------------------------
+## 2. Match taxa between genotype and phenotype
+##----------------------------------------------------------
+common_genos <- intersect(rownames(X), blues$Taxa)
+cat("Number of common genotypes:", length(common_genos), "\n")
+
+X <- X[common_genos, , drop = FALSE]
+y <- blues[match(common_genos, blues$Taxa), ]
+
+##----------------------------------------------------------
+## 3. Genomic relationship matrix
+##----------------------------------------------------------
+cat("Computing genomic relationship matrix\n")
+A1 <- A.mat(
+  X,
+  impute.method = "EM",
+  n.core = 1,
+  max.missing = 0.5
+)
+rownames(A1) <- common_genos
+colnames(A1) <- common_genos
+
+cat("G matrix dimensions:", dim(A1), "\n")
+cat("Range of G values:", range(A1), "\n")
+
+## optional quick view
+## heatmap(A1[1:100, 1:100])
+
+##----------------------------------------------------------
+## 4. Clean and align SNP list
+##----------------------------------------------------------
+## drop duplicate (Trait, SNP) rows
+snps_all <- snps_all[!duplicated(snps_all[, c("Trait", "SNP")]), ]
+
+## keep only SNPs that are present in genotype
+snps_all$in_geno <- snps_all$SNP %in% colnames(X)
+snps_use <- snps_all[snps_all$in_geno, c("Trait", "SNP")]
+
+## report missing ones
+missing_snps <- snps_all[!snps_all$in_geno, ]
+if (nrow(missing_snps) > 0) {
+  cat("SNPs in file but not in genotype matrix:\n")
+  print(missing_snps)
+}
+
+##----------------------------------------------------------
+## 5. Cross validation setup
+##----------------------------------------------------------
+set.seed(123)
+cycles <- 100
+folds  <- 10
+
+trait_names <- colnames(y)[-1]
+n_traits <- length(trait_names)
+
+prediction_accuracy <- matrix(nrow = cycles * folds, ncol = n_traits)
+colnames(prediction_accuracy) <- trait_names
+
+all_gebvs <- list()
+
+##----------------------------------------------------------
+## 6. CV loop
+##----------------------------------------------------------
+for (cycle in 1:cycles) {
+  
+  if (cycle %% 10 == 0) cat("Processing cycle", cycle, "of", cycles, "\n")
+  
+  set.seed(cycle)
+  fold_assignments <- sample(rep(1:folds, length.out = length(common_genos)))
+  
+  cycle_gebvs <- list()
+  
+  for (trait_idx in 2:ncol(y)) {
+    trait_name <- colnames(y)[trait_idx]
+    
+    ## trait specific SNPs
+    trait_snps <- snps_use$SNP[snps_use$Trait == trait_name]
+    if (length(trait_snps) > 0) {
+      X_sig_trait <- X[common_genos, trait_snps, drop = FALSE]
+      X_fixed_base <- cbind(Intercept = 1, X_sig_trait)
+    } else {
+      X_fixed_base <- cbind(Intercept = 1)
+    }
+    
+    for (fold in 1:folds) {
+      
+      test_genos <- common_genos[fold_assignments == fold]
+      
+      y_vec <- y[[trait_name]]
+      y_train_vec <- y_vec
+      y_train_vec[match(test_genos, common_genos)] <- NA
+      
+      fit <- mixed.solve(
+        y = y_train_vec,
+        K = A1,
+        X = X_fixed_base
+      )
+      
+      u_hat <- fit$u
+      names(u_hat) <- common_genos
+      
+      y_fixed_hat <- as.vector(X_fixed_base %*% fit$beta)
+      
+      y_test_pred   <- y_fixed_hat[match(test_genos, common_genos)] + u_hat[test_genos]
+      y_test_actual <- y_vec[match(test_genos, common_genos)]
+      
+      acc <- cor(y_test_pred, y_test_actual, use = "complete.obs")
+      
+      row_idx <- (cycle - 1) * folds + fold
+      prediction_accuracy[row_idx, trait_idx - 1] <- acc
+      
+      if (cycle == 1 && fold == 1) {
+        trait_gebv <- y_fixed_hat + u_hat
+        names(trait_gebv) <- common_genos
+        cycle_gebvs[[trait_name]] <- trait_gebv
+      }
+    }
+  }
+  
+  if (cycle == 1) {
+    all_gebvs <- cycle_gebvs
+  }
+}
+
+##----------------------------------------------------------
+## 7. Summaries
+##----------------------------------------------------------
+accuracy_summary <- data.frame(
+  Trait = colnames(prediction_accuracy),
+  Mean_Accuracy = apply(prediction_accuracy, 2, mean, na.rm = TRUE),
+  SD_Accuracy   = apply(prediction_accuracy, 2, sd,  na.rm = TRUE),
+  Min_Accuracy  = apply(prediction_accuracy, 2, min, na.rm = TRUE),
+  Max_Accuracy  = apply(prediction_accuracy, 2, max, na.rm = TRUE)
+)
+accuracy_summary <- accuracy_summary[order(-accuracy_summary$Mean_Accuracy), ]
+rownames(accuracy_summary) <- NULL
+
+print(accuracy_summary)
+
+##----------------------------------------------------------
+## 8. Coincidence index BLUP vs GEBV (first split)
+##----------------------------------------------------------
+get_topk <- function(x, taxa, k = 10, decreasing = TRUE) {
+  ord <- order(x, decreasing = decreasing, na.last = NA)
+  taxa[ord][seq_len(min(k, sum(!is.na(x))))]
+}
+
+res_list <- list()
+taxa_vec <- y$Taxa
+
+for (tr in colnames(y)[-1]) {
+  blup_vals <- y[[tr]]
+  gebv_vals <- all_gebvs[[tr]]
+  
+  top_blup <- get_topk(blup_vals, taxa = taxa_vec, k = 10)
+  top_gebv <- get_topk(gebv_vals, taxa = taxa_vec, k = 10)
+  
+  ci_fun <- function(a, b) {
+    if (any(is.na(a)) || any(is.na(b))) return(NA_real_)
+    length(intersect(a, b)) / length(a) * 100
+  }
+  
+  ci_val <- ci_fun(top_blup, top_gebv)
+  
+  res_list[[tr]] <- data.frame(
+    Trait = tr,
+    CI_BLUP_GEBV = ci_val,
+    stringsAsFactors = FALSE
+  )
+}
+
+coincidence_results <- bind_rows(res_list)
+print(coincidence_results)
+names(blues)
+##----------------------------------------------------------
+## 9. Plots
+##----------------------------------------------------------
+## nice labels for traits
+trait_labels <- c(
+  "SVG_score"    = "Vigor Score",
+  "canopy_coverage"     = "Canopy Area",
+  "canopy_height" = "Canopy Height",
+  "canopy_volume_index" = "Canopy Volume Index",
+  "ExGR"      = "ExGR",
+  "NGRDI" = "NGRDI"
+)
+
+
+accuracy_long <- data.frame(
+  Trait    = rep(colnames(prediction_accuracy), each = nrow(prediction_accuracy)),
+  Accuracy = as.vector(prediction_accuracy)
+)
+
+plot1 <- ggplot(accuracy_long,
+                aes(x = reorder(Trait, Accuracy, FUN = median), y = Accuracy)) +
+  geom_boxplot(fill = "lightblue", alpha = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  coord_flip() +
+  labs(
+    title = "A. Genomic prediction accuracy",
+    x = "Trait",
+    y = "Prediction accuracy"
+  ) +
+  scale_x_discrete(labels = trait_labels) +
+  theme_bw()
+
+plot2 <- ggplot(coincidence_results,
+                aes(x = reorder(Trait, CI_BLUP_GEBV), y = CI_BLUP_GEBV)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  labs(
+    title = "B. Selection coincidence index",
+    x = "Trait",
+    y = "Coincidence index (%)"
+  ) +
+  scale_x_discrete(labels = trait_labels) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+combined_plot <- plot1 + plot2 + plot_layout(ncol = 1)
+print(combined_plot)
+
+ggsave("combined_plot.jpg", plot = combined_plot, width = 10, height = 12, dpi = 300)
+
+##----------------------------------------------------------
+## 10. Save results
+##----------------------------------------------------------
+timestamp <- format(Sys.time(), "%Y-%m-%d_%H%M")
+
+write.csv(prediction_accuracy,
+          paste0("wp_SNP_GP_vigorTraits_Accuracy_", timestamp, "_", cycles, "cycles_", folds, "folds.csv"),
+          row.names = FALSE)
+
+write.csv(accuracy_summary,
+          paste0("wp_SNP_GP_vigorTraits_AccuracySummary_", timestamp, ".csv"),
+          row.names = FALSE)
+
+gebvs_df <- data.frame(Taxa = common_genos)
+for (tr in names(all_gebvs)) {
+  gebvs_df[[tr]] <- all_gebvs[[tr]][gebvs_df$Taxa]
+}
+write.csv(gebvs_df,
+          paste0("wp_SNP_GP_vigorTraits_GEBVs_", timestamp, ".csv"),
+          row.names = FALSE)
+
+write.csv(coincidence_results,
+          paste0("wp_SNP_GP_vigorTraits_Coincidence_", timestamp, ".csv"),
+          row.names = FALSE)
+
+cat("\nTotal time:",
+    round(difftime(Sys.time(), start.time, units = "mins"), 2),
+    "minutes\n")
+#######################################
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(readr)
+
+setwd("C:/Users/naresh89/Desktop/My projects/gwas/Seed image analysis/Genomic_prediction/seedGP/revised_gBLUP")
+
+## -----------------------------------------------------------
+## FILES (names already harmonized by you)
+## -----------------------------------------------------------
+acc_wg_file   <- "GP_SeedTraits_Accuracy_2025-11-06_2037_100cycles_10folds.csv"
+sum_wg_file   <- "GP_SeedTraits_AccuracySummary_2025-11-06_2037.csv"
+gebv_wg_file  <- "GP_SeedTraits_GEBVs_2025-11-06_2037.csv"
+
+acc_snp_file  <- "GP_SeedTraits_Accuracy_2025-11-10_1432_100cycles_10folds.csv"
+sum_snp_file  <- "GP_SeedTraits_AccuracySummary_2025-11-10_1432.csv"
+ci_snp_file   <- "GP_SeedTraits_GEBVs_2025-11-10_1432.csv"
+
+## -----------------------------------------------------------
+## 1) ACCURACY COMPARISON
+## -----------------------------------------------------------
+acc_wg  <- read.csv(acc_wg_file,  check.names = FALSE)
+acc_snp <- read.csv(acc_snp_file, check.names = FALSE)
+
+acc_wg$Model  <- "GBLUP"
+acc_snp$Model <- "GBLUP+SNP"
+
+acc_long <- bind_rows(acc_wg, acc_snp) |>
+  pivot_longer(
+    cols = -Model,
+    names_to = "Trait",
+    values_to = "Accuracy"
+  ) |>
+  filter(!is.na(Accuracy))
+
+## if names match, both models have all traits, so no need for fancy filtering
+p_acc <- ggplot(acc_long,
+                aes(x = Trait, y = Accuracy, fill = Model)) +
+  geom_boxplot(outlier.size = 0.4,
+               position = position_dodge(width = 0.75)) +
+  geom_hline(yintercept = 0, linetype = "dotted", color = "grey40") +
+  coord_flip() +
+  labs(title = "Genomic prediction accuracy: GBLUP vs GBLUP+SNP",
+       x = "Trait",
+       y = "Prediction accuracy") +
+  scale_fill_manual(values = c("GBLUP" = "grey70",
+                               "GBLUP+SNP" = "steelblue")) +
+  theme_bw()
+
+print(p_acc)
+ggsave("compare_accuracy_GBLUP_vs_SNP.jpg", p_acc, width = 8, height = 5, dpi = 300)
+
+## numeric diff
+sum_wg  <- read.csv(sum_wg_file,  stringsAsFactors = FALSE)
+sum_snp <- read.csv(sum_snp_file, stringsAsFactors = FALSE)
+
+comp_tbl <- sum_wg |>
+  select(Trait, Mean_Accuracy_wg = Mean_Accuracy) |>
+  inner_join(
+    sum_snp |>
+      select(Trait, Mean_Accuracy_snp = Mean_Accuracy),
+    by = "Trait"
+  ) |>
+  mutate(Diff = Mean_Accuracy_snp - Mean_Accuracy_wg) |>
+  arrange(desc(Diff))
+
+print(comp_tbl)
+
+## -----------------------------------------------------------
+## 2) REBUILD CI FOR WHOLE-GENOME (now names match)
+## -----------------------------------------------------------
+blues   <- read.csv("blues.csv", stringsAsFactors = FALSE)
+gebv_wg <- read.csv("WGP_SeedTraits_GEBVs_2025-11-14_1544.csv", stringsAsFactors = FALSE)
+
+get_topk <- function(x, taxa, k = 10, decreasing = TRUE) {
+  ord <- order(x, decreasing = decreasing, na.last = NA)
+  taxa[ord][seq_len(min(k, sum(!is.na(x))))]
+}
+
+res_ci_wg <- list()
+for (tr in setdiff(colnames(blues), "Taxa")) {
+  if (!(tr %in% colnames(gebv_wg))) next   # just in case
+  
+  blup_vals <- blues[[tr]]
+  gebv_vals <- gebv_wg[[tr]]
+  
+  top_blup <- get_topk(blup_vals, blues$Taxa, k = 10)
+  top_gebv <- get_topk(gebv_vals, gebv_wg$Taxa, k = 10)
+  
+  ci_val <- length(intersect(top_blup, top_gebv)) / length(top_blup) * 100
+  
+  res_ci_wg[[tr]] <- data.frame(
+    Trait = tr,
+    CI_BLUP_GEBV = ci_val,
+    stringsAsFactors = FALSE
+  )
+}
+ci_wg <- bind_rows(res_ci_wg)
+ci_wg$Model <- "GBLUP"
+write.csv(ci_wg, "WGP_CI_BLUP_GEBV_results.csv", row.names = FALSE)
+print(ci_wg)
+
+## -----------------------------------------------------------
+## 3) READ SNP-RUN CI AND PLOT
+## -----------------------------------------------------------
+ci_snp <- read.csv(ci_snp_file, stringsAsFactors = FALSE)
+ci_snp$Model <- "GBLUP+SNP"
+
+ci_long <- bind_rows(ci_wg, ci_snp)
+
+p_ci <- ggplot(ci_long,
+               aes(x = Trait, y = CI_BLUP_GEBV, fill = Model)) +
+  geom_col(position = position_dodge(width = 0.7)) +
+  labs(title = "Selection coincidence (top 10): GBLUP vs GBLUP+SNP",
+       x = "Trait",
+       y = "Coincidence index (%)") +
+  scale_fill_manual(values = c("GBLUP" = "grey70",
+                               "GBLUP+SNP" = "steelblue")) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p_ci)
+ggsave("compare_coincidence_GBLUP_vs_SNP.jpg", p_ci, width = 8, height = 5, dpi = 300)
+

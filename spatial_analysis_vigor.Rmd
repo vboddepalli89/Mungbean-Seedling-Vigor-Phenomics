@@ -1,0 +1,656 @@
+---
+title: "Spatial Analysis of Seedling Vigor Traits for BLUEs Generation"
+subtitle: "Two-Stage Spatial Analysis Using SpATS for GWAS"
+author: "Venkata Naresh Boddepalli"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    number_sections: true
+    theme: flatly
+    fig_width: 10
+    fig_height: 7
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, warning = FALSE, message = FALSE,
+  fig.align = "center", dpi = 150
+)
+```
+
+# Setup and Data Loading
+
+## Load Required Packages
+
+```{r load-packages}
+library(SpATS)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(reshape2)
+library(corrplot)
+library(moments)
+library(MASS)
+library(car)
+library(dplyr)   # reload dplyr last to unmask MASS::select
+library(patchwork)
+library(viridis)
+library(ggpubr)
+
+# Set output directory
+out_dir <- getwd()
+```
+
+## Read Data
+
+```{r read-data}
+raw <- read.csv("rawdata_vigor_all.csv", stringsAsFactors = FALSE)
+
+# Convert to appropriate types
+raw$env    <- as.factor(raw$env)
+raw$block  <- as.factor(raw$block)
+raw$line   <- as.factor(raw$line)
+raw$row    <- as.numeric(raw$row)
+raw$column <- as.numeric(raw$column)
+raw$plot   <- as.numeric(raw$plot)
+
+# Define trait columns
+traits <- c(
+  "manual_SVG_score", "canopy_height", "canopy_area", 
+  "canopy_coverage", "canopy_volume_index", 
+  "ExG", "ExGR", "NGRDI", "GLI", "GRVI", 
+  "RGBVI", "MGRVI", "VARI", "GBVI", 
+  "ExR", "ExB", "CIVE", "NGBDI"
+)
+
+cat("Dimensions:", dim(raw), "\n")
+cat("Environments:", levels(raw$env), "\n")
+cat("Genotypes:", nlevels(raw$line), "\n")
+cat("Blocks:", levels(raw$block), "\n")
+str(raw)
+summary(raw[, traits])
+```
+
+# Exploratory Data Analysis
+
+## Distribution of Traits (Overall)
+
+```{r eda-histograms, fig.height=10, fig.width=12}
+raw_long <- raw %>%
+  pivot_longer(cols = all_of(traits), names_to = "trait", values_to = "value")
+
+ggplot(raw_long, aes(x = value)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30,
+                 fill = "steelblue", alpha = 0.7) +
+  geom_density(color = "red", linewidth = 0.8) +
+  facet_wrap(~ trait, scales = "free", ncol = 3) +
+  theme_bw() +
+  labs(title = "Distribution of Raw Trait Values (All Environments)")
+```
+
+## Boxplots per Environment
+
+```{r eda-boxplots, fig.height=12, fig.width=14}
+ggplot(raw_long, aes(x = env, y = value, fill = env)) +
+  geom_boxplot(outlier.shape = 1, outlier.alpha = 0.4) +
+  facet_wrap(~ trait, scales = "free_y", ncol = 3) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none") +
+  labs(title = "Trait Distributions by Environment") +
+  scale_fill_viridis_d()
+```
+
+## Correlation Among Traits
+
+```{r eda-correlation, fig.height=7, fig.width=8}
+cor_mat <- cor(raw[, traits], use = "complete.obs")
+corrplot(cor_mat, method = "color", type = "upper",
+         addCoef.col = "black", number.cex = 0.8,
+         tl.col = "black", tl.cex = 0.9,
+         title = "Trait Correlations (Raw Data)", mar = c(0,0,2,0))
+```
+
+## Spatial Heatmaps of Raw Data
+
+```{r eda-spatial-heatmaps, fig.height=16, fig.width=14}
+for (tr in traits) {
+  p_list <- list()
+  for (e in levels(raw$env)) {
+    d_sub <- raw[raw$env == e, ]
+    p_list[[e]] <- ggplot(d_sub, aes(x = column, y = row, fill = .data[[tr]])) +
+      geom_tile() +
+      scale_fill_viridis_c(option = "C") +
+      theme_minimal() +
+      labs(title = e, fill = tr) +
+      coord_equal()
+  }
+  combined <- wrap_plots(p_list, ncol = 3) +
+    plot_annotation(title = paste("Spatial Heatmap:", tr))
+  print(combined)
+}
+```
+
+# Outlier Detection and Removal
+
+Outliers are detected using model-based standardized residuals from an initial SpATS fit.
+Observations with |standardized residual| > 3 are flagged and removed iteratively.
+
+```{r outlier-detection}
+# Helper: compute nseg as ~1/3 of unique positions, clamped to [4, 20]
+get_nseg <- function(d) {
+  nc <- max(4, min(20, length(unique(d$column)) %/% 3))
+  nr <- max(4, min(20, length(unique(d$row))    %/% 3))
+  c(nc, nr)
+}
+
+# Function to fit SpATS and detect outliers
+# genotype as random for speed during outlier detection
+fit_spats_detect_outliers <- function(data, trait, env_name, threshold = 3) {
+  d <- data[data$env == env_name, ]
+  d$geno <- as.factor(as.character(d$line))
+  nseg <- get_nseg(d)
+
+  tryCatch({
+    fit <- SpATS(
+      response  = trait,
+      genotype  = "geno",
+      genotype.as.random = TRUE,
+      spatial   = ~ PSANOVA(column, row, nseg = nseg, degree = 3, pord = 2),
+      fixed     = ~ block,
+      data      = d,
+      control   = list(tolerance = 1e-03, monitoring = 0)
+    )
+
+    resid_std <- residuals(fit) / sd(residuals(fit), na.rm = TRUE)
+    outlier_idx <- which(abs(resid_std) > threshold)
+
+    return(list(
+      fit = fit,
+      outliers = outlier_idx,
+      n_outliers = length(outlier_idx),
+      resid_std = resid_std
+    ))
+  }, error = function(e) {
+    message(paste("SpATS error for", trait, "in", env_name, ":", e$message))
+    return(NULL)
+  })
+}
+
+# Apply outlier detection across all envs and traits
+outlier_summary <- data.frame()
+dat_clean <- raw  # working copy
+
+for (tr in traits) {
+  for (e in levels(raw$env)) {
+
+    # Iterative outlier removal (max 2 rounds)
+    for (iter in 1:2) {
+      result <- fit_spats_detect_outliers(dat_clean, tr, e, threshold = 3)
+
+      if (is.null(result) || result$n_outliers == 0) break
+
+      # Get the row indices in dat_clean
+      env_rows <- which(dat_clean$env == e)
+      remove_rows <- env_rows[result$outliers]
+
+      outlier_summary <- rbind(outlier_summary, data.frame(
+        trait = tr, env = e, iteration = iter,
+        n_outliers = result$n_outliers
+      ))
+
+      # Set outlier values to NA (rather than removing rows, to preserve structure)
+      dat_clean[[tr]][remove_rows] <- NA
+    }
+  }
+}
+
+cat("\n=== Outlier Removal Summary ===\n")
+if (nrow(outlier_summary) > 0) {
+  print(outlier_summary)
+  cat("\nTotal NAs introduced per trait:\n")
+  print(colSums(is.na(dat_clean[, traits])))
+} else {
+  cat("No outliers detected.\n")
+}
+```
+
+# Normality and Assumption Checks
+
+After outlier removal, we verify the distributional assumptions by fitting SpATS models
+on the cleaned data and examining residuals.
+
+```{r normality-checks, fig.height=14, fig.width=12}
+normality_results <- data.frame()
+
+for (tr in traits) {
+  qq_plots <- list()
+  rv_plots <- list()
+
+  for (e in levels(dat_clean$env)) {
+    d <- dat_clean[dat_clean$env == e & !is.na(dat_clean[[tr]]), ]
+    d$geno <- as.factor(as.character(d$line))
+    nseg <- get_nseg(d)
+
+    fit <- tryCatch({
+      SpATS(
+        response  = tr,
+        genotype  = "geno",
+        genotype.as.random = TRUE,
+        spatial   = ~ PSANOVA(column, row, nseg = nseg, degree = 3, pord = 2),
+        fixed     = ~ block,
+        data      = d,
+        control   = list(tolerance = 1e-03, monitoring = 0)
+      )
+    }, error = function(err) NULL)
+
+    if (is.null(fit)) next
+
+    res <- residuals(fit)
+    fitted_vals <- fitted(fit)
+
+    # Shapiro-Wilk on subsample (max 5000)
+    set.seed(42)
+    res_sample <- if (length(res) > 5000) sample(res, 5000) else res
+    sw <- shapiro.test(res_sample)
+
+    skew_val <- skewness(res, na.rm = TRUE)
+    kurt_val <- kurtosis(res, na.rm = TRUE)
+
+    normality_results <- rbind(normality_results, data.frame(
+      trait = tr, env = e,
+      shapiro_W = round(sw$statistic, 4),
+      shapiro_p = format.pval(sw$p.value, digits = 3),
+      skewness = round(skew_val, 3),
+      kurtosis = round(kurt_val, 3)
+    ))
+
+    # Q-Q plot
+    qq_plots[[e]] <- ggplot(data.frame(res = res), aes(sample = res)) +
+      stat_qq(size = 0.8, alpha = 0.5) +
+      stat_qq_line(color = "red") +
+      theme_bw() +
+      labs(title = e)
+
+    # Residual vs fitted
+    rv_plots[[e]] <- ggplot(data.frame(fitted = fitted_vals, res = res),
+                            aes(x = fitted, y = res)) +
+      geom_point(size = 0.6, alpha = 0.4) +
+      geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+      geom_smooth(method = "loess", se = FALSE, color = "blue", linewidth = 0.5) +
+      theme_bw() +
+      labs(title = e)
+  }
+
+  # Print Q-Q plots
+  if (length(qq_plots) > 0) {
+    combined_qq <- wrap_plots(qq_plots, ncol = 3) +
+      plot_annotation(title = paste("Q-Q Plots of Residuals:", tr))
+    print(combined_qq)
+  }
+
+  # Print Residual vs Fitted plots
+  if (length(rv_plots) > 0) {
+    combined_rv <- wrap_plots(rv_plots, ncol = 3) +
+      plot_annotation(title = paste("Residuals vs Fitted:", tr))
+    print(combined_rv)
+  }
+}
+
+cat("\n=== Normality Test Results ===\n")
+print(normality_results, row.names = FALSE)
+# Save the summary table to your working directory
+write.csv(normality_results, 
+          file = file.path(out_dir, "Normality_Test_Results_Summary.csv"), 
+          row.names = FALSE)
+```
+
+# Environment-wise Spatial Analysis (SpATS) and BLUEs
+
+Using SpATS with genotype as **fixed** effect to extract BLUEs.
+Model: `trait ~ genotype(fixed) + block(fixed) + PSANOVA(column, row)`
+
+```{r env-wise-blues, fig.height=6, fig.width=10}
+blues_env_list <- list()
+spats_diagnostics <- data.frame()
+
+for (tr in traits) {
+  cat("\n========================================\n")
+  cat("Processing trait:", tr, "\n")
+  cat("========================================\n")
+
+  for (e in levels(dat_clean$env)) {
+    d <- dat_clean[dat_clean$env == e & !is.na(dat_clean[[tr]]), ]
+    d$geno <- as.factor(as.character(d$line))
+    nseg <- get_nseg(d)
+
+    # Genotype as FIXED for BLUEs extraction
+    fit <- tryCatch({
+      SpATS(
+        response  = tr,
+        genotype  = "geno",
+        genotype.as.random = FALSE,
+        spatial   = ~ PSANOVA(column, row, nseg = nseg, degree = 3, pord = 2),
+        fixed     = ~ block,
+        data      = d,
+        control   = list(tolerance = 1e-03, monitoring = 0)
+      )
+    }, error = function(err) {
+      message(paste("SpATS error:", tr, "in", e, "-", err$message))
+      NULL
+    })
+
+    if (is.null(fit)) next
+
+    # Extract BLUEs (genotype coefficients from fixed effects)
+    blues <- predict(fit, which = "geno")
+    blues_df <- data.frame(
+      line  = blues$geno,
+      env   = e,
+      trait = tr,
+      BLUE  = blues$predicted.values,
+      SE    = blues$standard.errors
+    )
+    blues_env_list[[paste(tr, e, sep = "_")]] <- blues_df
+
+    # Effective dimensions (spatial complexity)
+    ed <- fit$eff.dim
+    spats_diagnostics <- rbind(spats_diagnostics, data.frame(
+      trait = tr, env = e,
+      ED_f_col     = round(ed[["f(column)"]],        2),
+      ED_f_row     = round(ed[["f(row)"]],           2),
+      ED_f_col_row = round(ed[["f(column):f(row)"]], 2),
+      deviance     = round(fit$deviance, 2)
+    ))
+
+    # Plot spatial trend
+    cat(paste("\nSpatial trend plot:", tr, "-", e, "\n"))
+    tryCatch(plot(fit, main = paste(tr, "-", e)), error = function(err) NULL)
+  }
+}
+
+cat("\n=== SpATS Effective Dimensions ===\n")
+print(spats_diagnostics, row.names = FALSE)
+```
+
+## Compile Environment-wise BLUEs
+
+```{r compile-env-blues}
+blues_env_all <- do.call(rbind, blues_env_list)
+rownames(blues_env_all) <- NULL
+
+# Summary
+cat("Environment-wise BLUEs summary:\n")
+cat("Total records:", nrow(blues_env_all), "\n")
+cat("Traits:", unique(blues_env_all$trait), "\n")
+cat("Environments:", unique(blues_env_all$env), "\n")
+cat("Genotypes:", length(unique(blues_env_all$line)), "\n")
+
+# Reshape to wide format for output
+blues_env_wide <- blues_env_all %>%
+  dplyr::select(line, env, trait, BLUE) %>%
+  pivot_wider(names_from = trait, values_from = BLUE)
+
+head(blues_env_wide)
+
+# Save environment-wise BLUEs
+write.csv(blues_env_wide, file.path(out_dir, "BLUEs_per_environment.csv"),
+          row.names = FALSE)
+cat("\nSaved: BLUEs_per_environment.csv\n")
+```
+
+## Visualize Environment-wise BLUEs
+
+```{r viz-env-blues, fig.height=10, fig.width=12}
+ggplot(blues_env_all, aes(x = env, y = BLUE, fill = env)) +
+  geom_boxplot(outlier.shape = 1, outlier.alpha = 0.3) +
+  facet_wrap(~ trait, scales = "free_y", ncol = 3) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none") +
+  labs(title = "",
+       y = "BLUE Value") +
+  scale_fill_viridis_d()
+# First, run your plot code
+p_env_blues <- ggplot(blues_env_all, aes(x = env, y = BLUE, fill = env)) +
+  geom_boxplot(outlier.shape = 1, outlier.alpha = 0.3) +
+  facet_wrap(~ trait, scales = "free_y", ncol = 3) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "none") +
+  labs(title = "", y = "BLUE Value") +
+  scale_fill_viridis_d()
+
+# Then, save it with specific dimensions for 18 facets
+ggsave(filename = "Boxplots_Env_Wise_BLUEs.png", 
+       plot = p_env_blues,
+       width = 15,    # Wide enough for 3 columns
+       height = 20,   # Tall enough for 6 rows of facets
+       units = "in", 
+       dpi = 300)     # High resolution for manuscript
+```
+
+# Combined BLUEs Across All Environments (Two-Stage)
+
+Stage 2: Using environment-wise BLUEs as input, fit a mixed model with
+genotype as **fixed** and environment as **random** to obtain combined BLUEs.
+
+Model: `BLUE_ij ~ line_i (fixed) + (1|env_j)`
+
+```{r combined-blues}
+combined_blues_list <- list()
+heritability_results <- data.frame()
+
+for (tr in traits) {
+  cat("\n--- Combined analysis for:", tr, "---\n")
+
+  # Subset env-wise BLUEs for this trait
+  d_tr <- blues_env_all[blues_env_all$trait == tr, ]
+  d_tr$line <- as.factor(d_tr$line)
+  d_tr$env  <- as.factor(d_tr$env)
+
+  n_envs <- nlevels(d_tr$env)
+
+  # Fit mixed model: line (fixed) + env (random)
+  fit_combined <- tryCatch({
+    lmer(BLUE ~ line + (1 | env), data = d_tr)
+  }, error = function(err) {
+    message(paste("lmer error for", tr, ":", err$message))
+    NULL
+  })
+
+  if (is.null(fit_combined)) next
+
+  # Extract combined BLUEs using emmeans
+  emm <- emmeans(fit_combined, ~ line)
+  emm_df <- as.data.frame(emm)
+
+  combined_blues_list[[tr]] <- data.frame(
+    line  = emm_df$line,
+    trait = tr,
+    BLUE  = emm_df$emmean,
+    SE    = emm_df$SE
+  )
+
+  # Variance components for heritability
+  vc <- as.data.frame(VarCorr(fit_combined))
+  sigma2_e <- vc$vcov[vc$grp == "Residual"]
+  sigma2_env <- vc$vcov[vc$grp == "env"]
+
+  # Also fit with genotype as random for heritability estimation
+  fit_h2 <- tryCatch({
+    lmer(BLUE ~ (1 | line) + (1 | env), data = d_tr)
+  }, error = function(err) NULL)
+
+  if (!is.null(fit_h2)) {
+    vc_h2 <- as.data.frame(VarCorr(fit_h2))
+    sigma2_g   <- vc_h2$vcov[vc_h2$grp == "line"]
+    sigma2_res <- vc_h2$vcov[vc_h2$grp == "Residual"]
+    sigma2_env_h2 <- vc_h2$vcov[vc_h2$grp == "env"]
+
+    # Broad-sense heritability (entry-mean basis)
+    # H2 = sigma2_g / (sigma2_g + sigma2_res/n_envs)
+    H2 <- sigma2_g / (sigma2_g + sigma2_res / n_envs)
+
+    heritability_results <- rbind(heritability_results, data.frame(
+      trait = tr,
+      sigma2_geno = round(sigma2_g, 6),
+      sigma2_env  = round(sigma2_env_h2, 6),
+      sigma2_resid = round(sigma2_res, 6),
+      H2_entry_mean = round(H2, 4),
+      n_envs = n_envs
+    ))
+
+    cat(paste("  H² (entry-mean basis):", round(H2, 4), "\n"))
+  }
+}
+```
+
+## Compile and Save Combined BLUEs
+
+```{r save-combined-blues}
+combined_blues_all <- do.call(rbind, combined_blues_list)
+rownames(combined_blues_all) <- NULL
+
+# Reshape to wide format
+combined_blues_wide <- combined_blues_all %>%
+  dplyr::select(line, trait, BLUE) %>%
+  pivot_wider(names_from = trait, values_from = BLUE)
+
+cat("Combined BLUEs summary:\n")
+cat("Genotypes:", nrow(combined_blues_wide), "\n")
+cat("Traits:", ncol(combined_blues_wide) - 1, "\n")
+head(combined_blues_wide)
+
+write.csv(combined_blues_wide, file.path(out_dir, "BLUEs_combined.csv"),
+          row.names = FALSE)
+cat("\nSaved: BLUEs_combined.csv\n")
+```
+
+## Heritability Estimates
+
+```{r heritability}
+cat("\n=== Broad-Sense Heritability (Entry-Mean Basis) ===\n")
+print(heritability_results, row.names = FALSE)
+# 1. Save the raw heritability results as a CSV
+write.csv(heritability_results, 
+          file = file.path(out_dir, "Heritability_Results_All_Traits.csv"), 
+          row.names = FALSE)
+
+# 2. Create a "Manuscript-Ready" formatted version
+# This rounds the values and renames columns for professional presentation
+heritability_formatted <- heritability_results %>%
+  mutate(
+    H2_entry_mean = round(H2_entry_mean, 3),
+    sigma2_geno = round(sigma2_geno, 5),
+    sigma2_env = round(sigma2_env, 5),
+    sigma2_resid = round(sigma2_resid, 5)
+  ) %>%
+  rename(
+    Trait = trait,
+    `Genetic Variance` = sigma2_geno,
+    `Environmental Variance` = sigma2_env,
+    `Residual Variance` = sigma2_resid,
+    `Heritability (H2)` = H2_entry_mean,
+    `Environments (n)` = n_envs
+  )
+
+# Save the formatted version
+write.csv(heritability_formatted, 
+          file = file.path(out_dir, "Table_Heritability_Formatted.csv"), 
+          row.names = FALSE)
+
+cat("\nSaved: Heritability results have been exported to your working directory.\n")
+```
+
+## Visualize Combined BLUEs
+
+```{r viz-combined, fig.height=10, fig.width=12}
+# Histograms of combined BLUEs
+combined_long <- combined_blues_all %>%
+  dplyr::select(line, trait, BLUE)
+
+ggplot(combined_long, aes(x = BLUE)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 30,
+                 fill = "steelblue", alpha = 0.7) +
+  geom_density(color = "red", linewidth = 0.8) +
+  facet_wrap(~ trait, scales = "free", ncol = 3) +
+  theme_bw() +
+  labs(title = "Distribution of Combined BLUEs Across 6 Environments")
+```
+
+```{r combined-correlations, fig.height=7, fig.width=8}
+# Correlation among combined BLUEs
+cor_combined <- cor(combined_blues_wide[, -1], use = "complete.obs")
+corrplot(cor_combined, method = "color", type = "upper",
+         addCoef.col = "black", number.cex = 0.8,
+         tl.col = "black", tl.cex = 0.9,
+         title = "", mar = c(0,0,2,0))
+# Define the file path and settings
+# Using a high resolution (res = 300) for manuscript quality
+png(file.path(out_dir, "Figure_Trait_Correlations_BLUEs.png"), 
+    width = 10, 
+    height = 10, 
+    units = "in", 
+    res = 300)
+
+# Run the correlation plot command
+corrplot(cor_combined, 
+         method = "color", 
+         type = "upper",
+         addCoef.col = "black", 
+         number.cex = 0.7,      # Reduced slightly to ensure numbers fit
+         tl.col = "black", 
+         tl.cex = 0.8,          # Adjusted for 18 traits
+         title = "", 
+         mar = c(0,0,2,0))
+
+# Close the device to save the file
+dev.off()
+
+cat("\nSuccess: Correlation plot saved to", out_dir, "\n")
+```
+
+# GxE Visualization
+
+```{r gxe-viz, fig.height=10, fig.width=12}
+# Check genotype rank changes across environments for key traits
+for (tr in c("SVG_score", "canopy_height", "canopy_coverage")) {
+  d_tr <- blues_env_all[blues_env_all$trait == tr, ]
+
+  # Select top and bottom 10 genotypes based on mean BLUE
+  geno_means <- d_tr %>%
+    group_by(line) %>%
+    summarize(mean_blue = mean(BLUE, na.rm = TRUE)) %>%
+    arrange(desc(mean_blue))
+
+  top_bottom <- c(head(geno_means$line, 10), tail(geno_means$line, 10))
+
+  d_sub <- d_tr[d_tr$line %in% top_bottom, ]
+
+  p <- ggplot(d_sub, aes(x = env, y = BLUE, group = line, color = line)) +
+    geom_line(alpha = 0.7) +
+    geom_point(size = 1.5) +
+    theme_bw() +
+    theme(legend.position = "right",
+          legend.text = element_text(size = 6),
+          axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(title = paste("GxE Interaction:", tr, "(Top & Bottom 10 Genotypes)"),
+         y = "BLUE Value", color = "Genotype")
+
+  print(p)
+}
+```
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```

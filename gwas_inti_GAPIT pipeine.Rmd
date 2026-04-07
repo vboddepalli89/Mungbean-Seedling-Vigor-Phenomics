@@ -1,0 +1,470 @@
+---
+# Code for: UAV-based high-throughput phenotyping of seedling vigor in mungbean
+author: "Venkata Naresh Boddepalli"
+date: "2023-12-24"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(ggpubr)
+#install.packages("mvtnorm")
+
+library(inti)
+library(lme4)
+library(GAPIT)
+
+```
+
+
+
+```{r}
+
+#setwd("C:\\Users\\naresh89\\Desktop\\My projects\\GWAS\\Analysis_2024\\BLINK_MLM")
+myY <- read.table("C:\\Users\\naresh89\\Desktop\\My projects\\gwas\\seedlingvigor&seedweight\\GWAS_2026\\gwas_26\\blues.csv _phenotype.txt", head = TRUE)
+myG <- read.table("C:\\Users\\naresh89\\Desktop\\My projects\\gwas\\seedlingvigor&seedweight\\GWAS_2026\\gwas_26\\blues.csv _genotype.hmp.txt", comment.char = "")
+
+#myG <- read.table("mdp_genotype_test.hmp.txt", head = FALSE)
+myGAPIT <- GAPIT(G=myG, output.numerical=TRUE)
+myGD= myGAPIT$GD
+myGM= myGAPIT$GM
+
+
+#myGD=read.table("C:\\Users\\naresh89\\Desktop\\My projects\\GWAS\\Analysis_2024\\2023\\GAPIT.Genotype.Numerical.txt",head=T)
+#myGM=read.table("C:\\Users\\naresh89\\Desktop\\My projects\\GWAS\\Analysis_2024\\2023\\GAPIT.Genotype.map.txt",head=T)
+#Step 2: Run GAPIT
+#setwd("C:\\Users\\naresh89\\Desktop\\My projects\\GWAS\\Analysis_2024\\2023\\BLINK_farmCPU")
+myGAPIT <- GAPIT(
+  Y=myY,
+  GD=myGD,
+  GM=myGM,
+  PCA.total=3,
+  SNP.MAF = 0.05,
+  Multiple_analysis=TRUE,
+  model=c("Blink", "farmCPU", "MLM")
+  )
+
+```
+# ==============================================================================
+# SCRIPT: EXTRACT SIGNIFICANT GWAS HITS (M_eff Corrected)
+# ==============================================================================
+library(data.table)
+
+# 1. SETTINGS
+# Path to your GWAS results
+setwd(r"(C:\Users\naresh89\Desktop\My projects\gwas\seedlingvigor&seedweight\GWAS_2026\gwas_26\post_GWAS)")
+
+# Threshold Calculation (Based on your PLINK analysis)
+M_eff     <- 2513
+threshold <- 0.05 / M_eff
+
+print(paste("Using M_eff:", M_eff))
+print(paste("Significance Threshold (P-value):", formatC(threshold, format="e", digits=2)))
+print(paste("Significance Threshold (-log10): ", round(-log10(threshold), 2)))
+
+# 2. FIND FILES
+# Look for all GAPIT result files
+files <- list.files(pattern = "GAPIT.Association.GWAS_Results.*\\.csv$")
+
+print(paste("Found", length(files), "result files. Processing..."))
+
+# 3. LOOP AND FILTER
+all_significant_hits <- list()
+
+for (f in files) {
+  # Read file
+  # fill=TRUE handles cases where some rows might have issues, though GAPIT is usually clean
+  df <- fread(f)
+  
+  # Filter for Significant SNPs
+  # We use 'P.value' column (GAPIT standard)
+  sig_rows <- df[P.value < threshold]
+  
+  # If we found hits, process them
+  if (nrow(sig_rows) > 0) {
+    
+    # --- Parse Filename to get Model & Trait ---
+    # Filename format example: GAPIT.Association.GWAS_Results.BLINK.Aspect_Ratio.csv
+    
+    # Remove the standard prefix and suffix
+    clean_name <- sub("GAPIT.Association.GWAS_Results.", "", f)
+    clean_name <- sub(".csv", "", clean_name)
+    
+    # Identify Model (Check against known GAPIT model names)
+    model <- "Unknown"
+    if (grepl("BLINK", clean_name))        model <- "BLINK"
+    else if (grepl("FarmCPU", clean_name)) model <- "FarmCPU"
+    else if (grepl("MLM", clean_name))     model <- "MLM"
+    else if (grepl("GLM", clean_name))     model <- "GLM"
+    else if (grepl("CMLM", clean_name))    model <- "CMLM"
+    else if (grepl("SUPER", clean_name))   model <- "SUPER"
+    
+    # Identify Trait
+    # Logic: The trait is whatever is left in the name after removing the Model
+    # We strip the model name and any leading/trailing dots
+    trait_raw <- sub(model, "", clean_name)
+    trait <- gsub("^\\.|\\.$", "", trait_raw) # Remove dot at start or end
+    
+    # Add Info Columns
+    sig_rows$Model <- model
+    sig_rows$Trait <- trait
+    sig_rows$Source_File <- f
+    
+    # Add to list
+    all_significant_hits[[f]] <- sig_rows
+  }
+}
+
+# 4. COMBINE AND SAVE
+if (length(all_significant_hits) > 0) {
+  
+  final_table <- rbindlist(all_significant_hits)
+  
+  # Sort by Trait, then Chromosome, then Position
+  final_table <- final_table[order(Trait, Chr, Pos)]
+  
+  # Save to CSV
+  output_filename <- "Significant_GWAS_Hits_ALL_Traits.csv"
+  fwrite(final_table, output_filename)
+  
+  print("✅ SUCCESS!")
+  print(paste("Extracted", nrow(final_table), "significant SNPs."))
+  print(paste("Saved results to:", output_filename))
+  
+  # Preview
+  print(head(final_table[, .(Trait, Model, SNP, Chr, Pos, P.value)], 10))
+  
+} else {
+  print("⚠️ No significant SNPs found in any file using this threshold.")
+}
+#####################################
+# ------------------------------------------------------------------------------
+# MANHATTAN + QQ (With Lambda & Model Names)
+# ------------------------------------------------------------------------------
+
+library(tidyverse)
+library(ggrepel)
+library(patchwork)
+
+# ==============================================================================
+# 1. SETTINGS
+# ==============================================================================
+# Point to your results folder
+res_dir <- setwd(r"(C:\Users\naresh89\Desktop\My projects\gwas\seedlingvigor&seedweight\GWAS_2026\gwas_26\post_GWAS)")
+# --- THRESHOLDS ---
+M_eff       <- 2513
+thr_sig_p    <- 0.05 / M_eff
+thr_sig_logp <- -log10(thr_sig_p)
+
+print(paste("Significant Cutoff (Red Line):", round(thr_sig_logp, 2)))
+
+# ==============================================================================
+# 2. READ DATA
+# ==============================================================================
+files <- list.files(
+  path = res_dir,
+  pattern = "^GAPIT\\.Association\\.GWAS_Results\\..+\\.csv$",
+  full.names = TRUE
+)
+
+if(length(files) == 0) stop("No GAPIT results found! Check the folder path.")
+
+models_set <- c("BLINK", "FarmCPU")
+
+parse_name <- function(path) {
+  base  <- basename(path)
+  clean <- sub("GAPIT\\.Association\\.GWAS_Results\\.", "", base)
+  clean <- sub("\\.csv$", "", clean)
+  
+  parts <- strsplit(clean, "\\.")[[1]]
+  mdl   <- intersect(parts, models_set)[1]
+  
+  if(is.na(mdl)) return(list(model="Unknown", trait=clean))
+  
+  trt   <- paste(parts[parts != mdl], collapse=".")
+  list(model = mdl, trait = trt)
+}
+
+print("Loading data...")
+gwas_all <- map_df(files, function(f){
+  nm <- parse_name(f)
+  df <- read.csv(f, header = TRUE, stringsAsFactors = FALSE)
+  if(!"P.value" %in% names(df)) return(NULL)
+  
+  df %>%
+    rename(SNP = SNP, Chr = Chr, Pos = Pos, P = P.value) %>%
+    mutate(model = nm$model, trait = nm$trait) %>%
+    select(SNP, Chr, Pos, P, model, trait)
+})
+
+# ==============================================================================
+# 3. PLOTTING FUNCTIONS
+# ==============================================================================
+
+# Colors
+model_cols <- c("FarmCPU"="#D55E00","BLINK"="#0072B2")
+
+# Trait Names
+nice_names <- c(
+  "SVG_score"    = "Vigor Score",
+  "canopy_coverage"     = "Canopy Coverage",
+  "canopy_height" = "Canopy Height",
+  "canopy_volume_index" = "Canopy Volume Index"
+  )
+
+prepare_manhattan <- function(df_trait){
+  df <- df_trait %>% filter(!is.na(P), !is.na(Chr), !is.na(Pos))
+  chr_info <- df %>%
+    group_by(Chr) %>%
+    summarise(chr_len = max(Pos), .groups="drop") %>%
+    arrange(as.numeric(Chr)) %>%
+    mutate(tot = cumsum(chr_len) - chr_len)
+  
+  df2 <- df %>%
+    left_join(chr_info, by="Chr") %>%
+    mutate(pos_cum = Pos + tot, logp = -log10(pmax(P, 1e-300))) %>%
+    arrange(as.numeric(Chr), Pos)
+  
+  axis_df <- chr_info %>% mutate(center = tot + chr_len/2)
+  list(data = df2, axis = axis_df)
+}
+
+make_manhattan_plot <- function(df_tr, sig_line, nice_names, model_cols){
+  man <- prepare_manhattan(df_tr)
+  dat <- man$data; axis_df <- man$axis
+  tr_raw <- unique(dat$trait)[1]
+  plot_title <- ifelse(tr_raw %in% names(nice_names), nice_names[tr_raw], tr_raw)
+  
+  ggplot(dat, aes(pos_cum, logp, colour = model)) +
+    geom_point(size = 0.8, alpha = 0.7) +
+    
+    # Red Significant Line
+    geom_hline(yintercept = sig_line, colour = "red", linetype = "dashed", linewidth = 0.5) +
+    
+    # Annotate Top Hits
+    geom_text_repel(
+      data = dat %>% filter(logp >= sig_line),
+      aes(label = SNP), size = 2, max.overlaps = 20, colour = "black", show.legend=FALSE
+    ) +
+    
+    scale_colour_manual(values = model_cols) +
+    scale_x_continuous(breaks = axis_df$center, labels = axis_df$Chr) +
+    labs(title = plot_title, x = "Chromosome", y = "-log10(P)") +
+    theme_bw(base_size = 11) +
+    theme(
+      legend.position = "none",
+      panel.grid.major.x = element_blank(),
+      panel.grid.minor.x = element_blank()
+    )
+}
+
+make_qq_plot <- function(df_tr, model_cols){
+  # Prepare QQ Data
+  prep_qq <- function(pvec){
+    pvec <- sort(pvec)
+    n <- length(pvec)
+    tibble(exp = -log10((1:n)/(n+1)), obs = -log10(pmax(pvec, 1e-300)))
+  }
+  
+  qq_df <- df_tr %>%
+    filter(!is.na(P)) %>%
+    group_by(model) %>%
+    summarise(data = list(prep_qq(P)), .groups = "drop") %>%
+    unnest(cols = data)
+  
+  # --- ANNOTATION: Calculate Lambda and Create Label ---
+  annot_df <- df_tr %>%
+    filter(!is.na(P)) %>%
+    group_by(model) %>%
+    summarise(
+      # Lambda Calculation: Median(Observed) / Median(Expected)
+      lambda_val = median(qchisq(1 - P, 1)) / qchisq(0.5, 1),
+      .groups = "drop"
+    ) %>%
+    arrange(model) %>%
+    mutate(
+      # Create label: "Model (λ = 1.05)"
+      label_text = paste0(model, " (λ = ", sprintf("%.2f", lambda_val), ")"),
+      
+      # Positioning
+      x_pos = 0.5, 
+      max_y = max(qq_df$obs, na.rm=TRUE),
+      y_pos = max_y * 0.9 - (row_number() - 1) * (max_y * 0.15)
+    )
+  
+  ggplot(qq_df, aes(exp, obs, colour = model)) +
+    geom_abline(slope = 1, intercept = 0, colour = "gray40") +
+    geom_point(size = 0.8) +
+    
+    # --- COMBINED LABELS (Model + Lambda) ---
+    geom_text(
+      data = annot_df,
+      aes(x = x_pos, y = y_pos, label = label_text, colour = model),
+      hjust = 0, size = 3.2, fontface = "bold", show.legend = FALSE
+    ) +
+    
+    scale_colour_manual(values = model_cols) +
+    labs(x = "Expected", y = "Observed") +
+    theme_bw(base_size = 11) +
+    theme(legend.position = "none") 
+}
+
+# ==============================================================================
+# 4. BUILD & SAVE
+# ==============================================================================
+out_dir <- file.path(res_dir, "plots_combined_v3")
+dir.create(out_dir, showWarnings = FALSE)
+
+all_traits <- unique(gwas_all$trait)
+combined_list <- list()
+
+print("Generating plots...")
+
+for (tr in all_traits){
+  df_tr <- gwas_all %>% filter(trait == tr)
+  
+  p1 <- make_manhattan_plot(df_tr, thr_sig_logp, nice_names, model_cols)
+  p2 <- make_qq_plot(df_tr, model_cols)
+  
+  combined <- (p1 + p2) + plot_layout(ncol = 2, widths = c(3, 1))
+  combined_list[[tr]] <- combined
+  
+  ggsave(file.path(out_dir, paste0("GWAS_", tr, ".png")), combined, width = 10, height = 4, dpi = 300)
+}
+
+print("Saving stacked summary...")
+final_stack <- wrap_plots(combined_list, ncol = 1)
+ggsave(file.path(out_dir, "GWAS_Summary_All_Traits_With_Lambda.png"), 
+       final_stack, width = 10, height = 3.5 * length(all_traits), dpi = 300, limitsize = FALSE)
+
+print(paste("✅ Done! Plots saved to:", out_dir))
+###########################
+# ==============================================================================
+# SCRIPT: CALCULATE PVE, ALLELES, AND EFFECT SIZES
+# ==============================================================================
+library(data.table)
+
+# 1. SETTINGS
+#setwd("C:/Users/naresh89/Desktop/My projects/gwas/Seed image analysis/GWAS_Weilv9/GWAS_results")
+
+hits_file  <- "Significant_GWAS_Hits_ALL_Traits.csv"
+geno_file  <- "blues.csv _genotype.hmp.txt"  # HapMap format
+pheno_file <- "blues.csv _phenotype.txt"
+
+# 2. LOAD DATA
+print("Loading files...")
+hits  <- fread(hits_file)
+pheno <- fread(pheno_file) # Auto-detects tab/comma
+geno  <- fread(geno_file)
+
+# 3. HELPER FUNCTION: CONVERT IUPAC TO NUMERIC (0, 1, 2)
+# ------------------------------------------------------------------------------
+# Returns a list with: $genotype (numeric vector), $major (char), $minor (char)
+convert_genotype <- function(geno_vector) {
+  # definitions
+  iupac_map <- list(
+    'A'=c('A','A'), 'C'=c('C','C'), 'G'=c('G','G'), 'T'=c('T','T'),
+    'R'=c('A','G'), 'Y'=c('C','T'), 'S'=c('G','C'), 'W'=c('A','T'),
+    'K'=c('G','T'), 'M'=c('A','C'), 'N'=c(NA,NA)
+  )
+  
+  # Flatten to find Major/Minor alleles
+  all_bases <- unlist(lapply(geno_vector, function(x) iupac_map[[x]]))
+  all_bases <- all_bases[!is.na(all_bases)]
+  
+  if(length(all_bases) == 0) return(list(genotype=rep(NA, length(geno_vector)), major=NA, minor=NA))
+  
+  # Count Alleles
+  counts <- sort(table(all_bases), decreasing=TRUE)
+  major  <- names(counts)[1]
+  minor  <- ifelse(length(counts) > 1, names(counts)[2], NA)
+  
+  # Encode: 0 = MajorHom, 1 = Het, 2 = MinorHom
+  numeric_geno <- sapply(geno_vector, function(x) {
+    bases <- iupac_map[[x]]
+    if(any(is.na(bases))) return(NA)
+    
+    # Check match
+    has_major <- major %in% bases
+    has_minor <- !is.na(minor) && (minor %in% bases)
+    
+    if(has_major && !has_minor) return(0)      # Homozygous Major
+    if(!has_major && has_minor) return(2)      # Homozygous Minor (or other)
+    if(has_major && has_minor)  return(1)      # Heterozygous
+    return(NA)
+  })
+  
+  return(list(genotype=numeric_geno, major=major, minor=minor))
+}
+
+# 4. MAIN LOOP
+# ------------------------------------------------------------------------------
+print("Calculating Stats for Significant Hits...")
+
+# Initialize new columns
+hits$PVE <- NA
+hits$Major_Allele <- NA
+hits$Minor_Allele <- NA
+hits$Calc_Effect  <- NA
+hits$Calc_SE      <- NA
+
+# Get Taxa names (Columns 12 onwards in HapMap usually)
+# We check the column names of geno that exist in pheno
+taxa_cols <- intersect(colnames(geno), pheno$Taxa)
+
+for(i in 1:nrow(hits)) {
+  snp_id <- hits$SNP[i]
+  trait  <- hits$Trait[i]
+  
+  # 1. Get Genotype Data
+  # Find row in geno file
+  snp_row <- geno[geno$`rs#` == snp_id, ..taxa_cols]
+  
+  if(nrow(snp_row) == 0) next # SNP not found
+  
+  # Convert to vector
+  geno_vec <- as.character(as.vector(snp_row[1,]))
+  
+  # Convert IUPAC -> Numeric
+  geno_info <- convert_genotype(geno_vec)
+  
+  # 2. Get Phenotype Data
+  pheno_vec <- pheno[match(taxa_cols, pheno$Taxa), ..trait][[1]]
+  
+  # 3. Create Data Frame for LM
+  df <- data.frame(Y = pheno_vec, X = geno_info$genotype)
+  df <- na.omit(df) # Remove missing data
+  
+  if(nrow(df) < 5) next # Skip if too few lines
+  
+  # 4. Run Linear Model
+  model <- lm(Y ~ X, data = df)
+  s     <- summary(model)
+  
+  # 5. Extract Stats
+  # Effect of Minor Allele (Slope of X)
+  beta <- coef(s)["X", "Estimate"]
+  se   <- coef(s)["X", "Std. Error"]
+  r2   <- s$r.squared
+  
+  # Store
+  hits$PVE[i]          <- r2
+  hits$Calc_Effect[i]  <- beta
+  hits$Calc_SE[i]      <- se
+  hits$Major_Allele[i] <- geno_info$major
+  hits$Minor_Allele[i] <- geno_info$minor
+}
+
+# 5. SAVE
+write.csv(hits, "Significant_GWAS_Hits_With_Stats.csv", row.names=FALSE)
+print("✅ Done! Saved 'Significant_GWAS_Hits_With_Stats.csv'")
+print(head(hits[, c("SNP", "Trait", "PVE", "Calc_Effect")]))
+
