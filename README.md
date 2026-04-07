@@ -1,7 +1,3 @@
-# Mungbean-Seedling-Vigor-Phenomics
-Analysis pipeline for UAV-based high-throughput phenotyping and genetic dissection of mungbean seedling vigor
-# UAV-based Mungbean Seedling Vigor Phenomics
-
 This repository contains the high-throughput phenotyping (HTP) pipeline and genetic analysis scripts for the study:  
 **"UAV-based high-throughput phenotyping enables genetic dissection and genomic prediction of early seedling vigor in mungbean (Vigna radiata L.)"**
 
